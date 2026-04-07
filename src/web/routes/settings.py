@@ -54,7 +54,7 @@ class RegistrationSettings(BaseModel):
     default_password_length: int = 12
     sleep_min: int = 5
     sleep_max: int = 30
-    entry_flow: str = "native"
+    entry_flow: str = "abcard"
     auto_enabled: bool = False
     auto_check_interval: int = 60
     auto_min_ready_auth_files: int = 1
@@ -97,7 +97,7 @@ async def get_all_settings():
     """获取所有设置"""
     settings = get_settings()
 
-    entry_flow_raw = str(settings.registration_entry_flow or "native").strip().lower()
+    entry_flow_raw = str(settings.registration_entry_flow or "abcard").strip().lower()
     entry_flow = "abcard" if entry_flow_raw == "abcard" else "native"
 
     return {
@@ -308,7 +308,7 @@ async def get_registration_settings():
     """获取注册设置"""
     settings = get_settings()
 
-    entry_flow_raw = str(settings.registration_entry_flow or "native").strip().lower()
+    entry_flow_raw = str(settings.registration_entry_flow or "abcard").strip().lower()
     entry_flow = "abcard" if entry_flow_raw == "abcard" else "native"
 
     return {
@@ -344,7 +344,7 @@ async def update_registration_settings(request: RegistrationSettings):
     if request.sleep_min < 1 or request.sleep_max < request.sleep_min:
         raise HTTPException(status_code=400, detail="注册等待时间参数无效")
 
-    flow_raw = (request.entry_flow or "native").strip().lower()
+    flow_raw = (request.entry_flow or "abcard").strip().lower()
     # 兼容旧前端历史值：outlook -> native（Outlook 邮箱会在运行时自动走 outlook 链路）。
     flow = "native" if flow_raw == "outlook" else flow_raw
     if flow not in {"native", "abcard"}:

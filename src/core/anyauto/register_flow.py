@@ -33,23 +33,37 @@ class EmailServiceAdapter:
         exclude.update(self._used_codes)
         deadline = time.time() + max(1, int(timeout))
         sent_at = otp_sent_at or time.time()
+        attempt = 0
 
         while time.time() < deadline:
+            attempt += 1
             remaining = max(1, int(deadline - time.time()))
-            code = self.es.get_verification_code(
-                email=email,
-                email_id=self.email_id,
-                timeout=remaining,
-                otp_sent_at=sent_at,
+            self.log_fn(
+                f"等待验证码轮询 #{attempt}，邮箱={email}，剩余 {remaining}s，已排除 {len(exclude)} 个旧码"
             )
+            try:
+                code = self.es.get_verification_code(
+                    email=email,
+                    email_id=self.email_id,
+                    timeout=remaining,
+                    otp_sent_at=sent_at,
+                )
+            except Exception as e:
+                self.log_fn(f"获取验证码异常: {e}")
+                code = None
+
             if not code:
-                return None
+                self.log_fn("本轮未收到验证码，继续等待...")
+                continue
             if code in exclude:
                 exclude.add(code)
+                self.log_fn(f"跳过已使用/旧验证码: {code}")
                 continue
             self._used_codes.add(code)
             self.log_fn(f"成功获取验证码: {code}")
             return code
+
+        self.log_fn(f"等待验证码超时: {email}")
         return None
 
 
@@ -191,12 +205,23 @@ class AnyAutoRegistrationEngine:
         password_len = int(getattr(settings, "registration_default_password_length", DEFAULT_PASSWORD_LENGTH) or DEFAULT_PASSWORD_LENGTH)
 
         oauth_config = dict(self.extra_config or {})
-        if not oauth_config:
-            oauth_config = {
-                "oauth_issuer": str(getattr(settings, "openai_auth_url", "") or "https://auth.openai.com"),
-                "oauth_client_id": str(getattr(settings, "openai_client_id", "") or "app_EMoamEEZ73f0CkXaXp7hrann"),
-                "oauth_redirect_uri": str(getattr(settings, "openai_redirect_uri", "") or "http://localhost:1455/auth/callback"),
-            }
+        raw_auth_url = str(
+            oauth_config.get("oauth_issuer")
+            or getattr(settings, "openai_auth_url", "")
+            or "https://auth.openai.com/oauth/authorize"
+        ).strip()
+        oauth_issuer = "https://auth.openai.com"
+        try:
+            from urllib.parse import urlparse
+            parsed = urlparse(raw_auth_url)
+            if parsed.scheme and parsed.netloc:
+                oauth_issuer = f"{parsed.scheme}://{parsed.netloc}"
+        except Exception:
+            pass
+        oauth_config["oauth_issuer"] = oauth_issuer
+        oauth_config.setdefault("oauth_client_id", str(getattr(settings, "openai_client_id", "") or "app_EMoamEEZ73f0CkXaXp7hrann"))
+        oauth_config.setdefault("oauth_redirect_uri", str(getattr(settings, "openai_redirect_uri", "") or "http://localhost:1455/auth/callback"))
+        self._log(f"OAuth 配置归一化: issuer={oauth_issuer} auth_url={raw_auth_url}")
 
         for attempt in range(self.max_retries):
             try:
@@ -287,9 +312,10 @@ class AnyAutoRegistrationEngine:
                             "id_token": pwdless.get("id_token", ""),
                         }
 
-                # 5. 复用 session 取 token
+                # 5. 先复用 session 取 access/session，再按需补全 OAuth refresh_token
                 self._log("步骤 2/2: 优先复用注册会话提取 ChatGPT Session / AccessToken...")
                 session_ok, session_result = chatgpt_client.reuse_session_and_get_tokens()
+                session_success_payload = None
                 if session_ok:
                     self._log("Token 提取完成！")
                     account_id = str(session_result.get("account_id", "") or "").strip()
@@ -298,7 +324,7 @@ class AnyAutoRegistrationEngine:
                     if not account_id:
                         account_id = self._extract_account_id_from_token(session_result.get("access_token", ""))
                     workspace_id = str(session_result.get("workspace_id", "") or "").strip() or account_id
-                    return {
+                    session_success_payload = {
                         "success": True,
                         "access_token": session_result.get("access_token", ""),
                         "session_token": session_result.get("session_token", ""),
@@ -310,11 +336,17 @@ class AnyAutoRegistrationEngine:
                             "user_id": session_result.get("user_id", ""),
                             "user": session_result.get("user") or {},
                             "account": session_result.get("account") or {},
+                            "token_mode": "session_access_only",
                         },
                     }
+                    self._log(
+                        "已拿到 access_token，但 refresh_token 仍未知，继续尝试 OAuth 补全... "
+                        f"account_id={account_id} workspace_id={workspace_id}"
+                    )
+                else:
+                    self._log(f"复用会话失败，回退到 OAuth 登录补全流程: {session_result}")
 
-                # 6. OAuth 回退
-                self._log(f"复用会话失败，回退到 OAuth 登录补全流程: {session_result}")
+                # 6. OAuth 补全 / 回退
                 tokens = None
                 oauth_client = None
                 for oauth_attempt in range(2):
@@ -322,6 +354,7 @@ class AnyAutoRegistrationEngine:
                         self._log(f"同账号 OAuth 重试 {oauth_attempt + 1}/2 ...")
                         time.sleep(1)
 
+                    self._log(f"启动 OAuth 补全过程 {oauth_attempt + 1}/2 ...")
                     oauth_client = OAuthClient(
                         config=oauth_config,
                         proxy=self.proxy_url,
@@ -378,6 +411,9 @@ class AnyAutoRegistrationEngine:
                         "account_id": account_id or ("v2_acct_" + chatgpt_client.device_id[:8]),
                         "workspace_id": workspace_id or account_id,
                         "session_token": session_cookie,
+                        "metadata": {
+                            "token_mode": "oauth_full",
+                        },
                     }
 
                 # 7. 手机号验证需求：按成功返回，但标记为待补全
@@ -391,6 +427,12 @@ class AnyAutoRegistrationEngine:
                             "oauth_error": oauth_client.last_error,
                         },
                     }
+
+                if session_success_payload:
+                    oauth_err = str(getattr(oauth_client, "last_error", "") or "").strip() or str(session_result or "")
+                    self._log(f"OAuth 未补齐 refresh_token，降级保留 session access_token 结果: {oauth_err}")
+                    session_success_payload.setdefault("metadata", {})["oauth_error"] = oauth_err
+                    return session_success_payload
 
                 last_error = str(getattr(oauth_client, "last_error", "") or "").strip() or "获取最终 OAuth Tokens 失败"
                 return {"success": False, "error_message": f"账号已创建成功，但 {last_error}"}

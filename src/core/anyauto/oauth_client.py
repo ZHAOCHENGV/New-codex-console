@@ -611,6 +611,16 @@ class OAuthClient:
             self._set_error("Bootstrap 失败")
             return None
 
+        try:
+            cookie_names = sorted({cookie.name for cookie in self.session.cookies.jar})
+        except Exception:
+            cookie_names = []
+        self._log(
+            "OAuth bootstrap 完成: "
+            f"final_url={str(authorize_final_url)[:140]} "
+            f"cookies={cookie_names[:20]}"
+        )
+
         continue_referer = (
             authorize_final_url
             if authorize_final_url.startswith(self.oauth_issuer)
@@ -633,6 +643,12 @@ class OAuthClient:
             return None
 
         self._log(f"OAuth 状态起点: {describe_flow_state(state)}")
+        self._log(
+            "OAuth continue 结果: "
+            f"page={getattr(state, 'page_type', '')} "
+            f"current={str(getattr(state, 'current_url', '') or '')[:140]} "
+            f"next={str(getattr(state, 'continue_url', '') or '')[:140]}"
+        )
         seen_states = {}
         referer = continue_referer
 
@@ -804,6 +820,16 @@ class OAuthClient:
             self._set_error("Bootstrap 失败")
             return None
 
+        try:
+            cookie_names = sorted({cookie.name for cookie in self.session.cookies.jar})
+        except Exception:
+            cookie_names = []
+        self._log(
+            "Passwordless OAuth bootstrap 完成: "
+            f"final_url={str(authorize_final_url)[:140]} "
+            f"cookies={cookie_names[:20]}"
+        )
+
         continue_referer = (
             authorize_final_url
             if authorize_final_url.startswith(self.oauth_issuer)
@@ -827,6 +853,12 @@ class OAuthClient:
             return None
 
         self._log(f"Passwordless OAuth 状态起点: {describe_flow_state(state)}")
+        self._log(
+            "Passwordless OAuth continue 结果: "
+            f"page={getattr(state, 'page_type', '')} "
+            f"current={str(getattr(state, 'current_url', '') or '')[:140]} "
+            f"next={str(getattr(state, 'continue_url', '') or '')[:140]}"
+        )
 
         send_ok, send_detail = self._send_email_otp(
             device_id,
@@ -1298,6 +1330,11 @@ class OAuthClient:
     def _exchange_code_for_tokens(self, code, code_verifier, user_agent, impersonate):
         """用 authorization code 换取 tokens"""
         url = f"{self.oauth_issuer}/oauth/token"
+        self._log(
+            "准备交换 OAuth tokens: "
+            f"code={str(code or '')[:24]}... "
+            f"redirect_uri={self.oauth_redirect_uri} client_id={self.oauth_client_id}"
+        )
         
         payload = {
             "grant_type": "authorization_code",
@@ -1324,9 +1361,18 @@ class OAuthClient:
 
             self._browser_pause()
             r = self.session.post(url, **kwargs)
+            self._log(f"/oauth/token -> {r.status_code}")
             
             if r.status_code == 200:
-                return r.json()
+                data = r.json()
+                self._log(
+                    "OAuth token 结果: "
+                    f"has_access={bool(str(data.get('access_token') or '').strip())} "
+                    f"has_refresh={bool(str(data.get('refresh_token') or '').strip())} "
+                    f"has_id={bool(str(data.get('id_token') or '').strip())} "
+                    f"scope={str(data.get('scope') or '')[:120]}"
+                )
+                return data
             else:
                 self._set_error(f"换取 tokens 失败: {r.status_code} - {r.text[:200]}")
                 

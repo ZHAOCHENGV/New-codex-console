@@ -127,9 +127,9 @@ class RegistrationEngine:
             scope=settings.openai_scope,
             proxy_url=proxy_url  # 传递代理配置
         )
-        entry_flow = str(getattr(settings, "registration_entry_flow", "native") or "native").strip().lower()
+        entry_flow = str(getattr(settings, "registration_entry_flow", "abcard") or "abcard").strip().lower()
         # 配置层仅保留 native/abcard；Outlook 邮箱在执行时自动切换 outlook 链路。
-        self.registration_entry_flow: str = entry_flow if entry_flow in {"native", "abcard"} else "native"
+        self.registration_entry_flow: str = entry_flow if entry_flow in {"native", "abcard"} else "abcard"
 
         # 状态变量
         self.email: Optional[str] = None
@@ -2001,13 +2001,53 @@ class RegistrationEngine:
                 "username": self.email
             })
 
+            headers = {
+                "referer": "https://auth.openai.com/create-account/password",
+                "accept": "application/json",
+                "content-type": "application/json",
+                "origin": "https://auth.openai.com",
+                "sec-fetch-site": "same-origin",
+                "sec-fetch-mode": "cors",
+                "sec-fetch-dest": "empty",
+                "oai-device-id": str(did or self.device_id or "").strip(),
+            }
+            try:
+                if self.session is not None:
+                    ua = getattr(self.session, "headers", {}).get("User-Agent")
+                    al = getattr(self.session, "headers", {}).get("Accept-Language")
+                    sch = getattr(self.session, "headers", {}).get("sec-ch-ua")
+                    schm = getattr(self.session, "headers", {}).get("sec-ch-ua-mobile")
+                    schp = getattr(self.session, "headers", {}).get("sec-ch-ua-platform")
+                    if ua:
+                        headers["user-agent"] = ua
+                    if al:
+                        headers["accept-language"] = al
+                    if sch:
+                        headers["sec-ch-ua"] = sch
+                    if schm:
+                        headers["sec-ch-ua-mobile"] = schm
+                    if schp:
+                        headers["sec-ch-ua-platform"] = schp
+                if sen_token:
+                    headers["openai-sentinel-token"] = str(sen_token or "").strip()
+                headers.update(generate_datadog_trace())
+            except Exception:
+                pass
+
+            try:
+                cookie_dump = self._dump_session_cookies()
+            except Exception:
+                cookie_dump = ""
+            self._log(
+                "native register 请求摘要: "
+                f"did={str(did or self.device_id or '').strip()} "
+                f"has_sentinel={'openai-sentinel-token' in headers} "
+                f"cookie_snippet={cookie_dump[:300]}"
+            )
+
             response = self.session.post(
                 OPENAI_API_ENDPOINTS["register"],
-                headers={
-                    "referer": "https://auth.openai.com/create-account/password",
-                    "accept": "application/json",
-                    "content-type": "application/json",
-                },
+                headers=headers,
                 data=register_body,
             )
 
@@ -2015,6 +2055,14 @@ class RegistrationEngine:
 
             if response.status_code != 200:
                 error_text = response.text[:500]
+                try:
+                    post_cookie_dump = self._dump_session_cookies()
+                except Exception:
+                    post_cookie_dump = ""
+                self._log(
+                    f"native register 失败上下文: final_url={str(response.url)[:120]} cookies={post_cookie_dump[:300]}",
+                    "warning",
+                )
                 self._log(f"密码注册失败: {error_text}", "warning")
 
                 # 解析错误信息，判断是否是邮箱已注册

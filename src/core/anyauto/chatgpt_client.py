@@ -8,6 +8,8 @@ import uuid
 import time
 from urllib.parse import urlparse
 
+from ...config.settings import get_settings
+
 try:
     from curl_cffi import requests as curl_requests
 except ImportError:
@@ -16,6 +18,10 @@ except ImportError:
     sys.exit(1)
 
 from .sentinel_token import build_sentinel_token
+try:
+    from .sentinel_browser import get_sentinel_token_via_browser
+except ImportError:
+    get_sentinel_token_via_browser = None
 from .utils import (
     FlowState,
     build_browser_headers,
@@ -111,11 +117,55 @@ class ChatGPTClient:
         # 设置 oai-did cookie
         seed_oai_device_cookie(self.session, self.device_id)
         self.last_registration_state = FlowState()
+        self.last_stage = ""
     
+    def _get_sentinel_token(self, flow: str, *, page_url: str | None = None):
+        prefer_browser = flow in {"username_password_create", "oauth_create_account"}
+        if prefer_browser and get_sentinel_token_via_browser is not None:
+            try:
+                token = get_sentinel_token_via_browser(
+                    flow=flow,
+                    proxy=self.proxy,
+                    page_url=page_url,
+                    headless=self.browser_mode != "headed",
+                    device_id=self.device_id,
+                    log_fn=lambda msg: self._log(msg),
+                )
+                if token:
+                    self._log(f"{flow}: 已通过 Playwright SentinelSDK 获取 token")
+                    return token
+            except Exception as e:
+                self._log(f"{flow}: Playwright SentinelSDK 获取 token 失败，回退 HTTP PoW: {e}")
+        elif prefer_browser:
+            self._log(f"{flow}: 未找到 sentinel_browser，直接回退 HTTP PoW")
+
+        if prefer_browser and get_sentinel_token_via_browser is not None:
+            self._log(f"{flow}: 浏览器 Sentinel 不可用，继续尝试 HTTP PoW")
+
+        token = build_sentinel_token(
+            self.session,
+            self.device_id,
+            flow=flow,
+            user_agent=self.ua,
+            sec_ch_ua=self.sec_ch_ua,
+            impersonate=self.impersonate,
+        )
+        if token:
+            self._log(f"{flow}: 已通过 HTTP PoW 获取 token")
+        return token
+
     def _log(self, msg):
         """输出日志"""
         if self.verbose:
             print(f"  {msg}")
+
+    def _enter_stage(self, stage: str, detail: str = ""):
+        self.last_stage = str(stage or "").strip()
+        if self.last_stage:
+            message = f"[stage={self.last_stage}]"
+            if detail:
+                message += f" {detail}"
+            self._log(message)
 
     def _browser_pause(self, low=0.15, high=0.45):
         """在 headed 模式下加入轻微停顿，模拟有头浏览器节奏。"""
@@ -550,6 +600,7 @@ class ChatGPTClient:
         Returns:
             tuple: (success, message)
         """
+        self._enter_stage("authorize_continue", f"register_user email={email}")
         self._log(f"注册用户: {email}")
         url = f"{self.AUTH}/api/accounts/user/register"
         
@@ -562,19 +613,43 @@ class ChatGPTClient:
             fetch_site="same-origin",
         )
         headers.update(generate_datadog_trace())
+        headers["oai-device-id"] = self.device_id
+
+        sentinel_token = self._get_sentinel_token(
+            "username_password_create",
+            page_url=f"{self.AUTH}/create-account/password",
+        )
+        if sentinel_token:
+            headers["openai-sentinel-token"] = sentinel_token
+            self._log("register_user: 已生成 sentinel token")
+        else:
+            self._log("register_user: 未生成 sentinel token，降级继续请求")
         
         payload = {
             "username": email,
             "password": password,
         }
-        
+
         try:
+            try:
+                cookie_names = sorted({str(k) for k in self.session.cookies.keys()})
+            except Exception:
+                cookie_names = []
+            self._log(
+                "register_user 请求摘要: "
+                f"did={self.device_id} "
+                f"has_sentinel={'openai-sentinel-token' in headers} "
+                f"cookie_keys={cookie_names} "
+                f"has_login_session={'login_session' in cookie_names} "
+                f"has_oai_did={'oai-did' in cookie_names}"
+            )
             self._browser_pause()
             r = self.session.post(url, json=payload, headers=headers, timeout=30)
             
             if r.status_code == 200:
                 data = r.json()
                 self._log("注册成功")
+                self._log(f"authorize_continue/register_user 响应 URL: {str(r.url)[:120]}")
                 return True, "注册成功"
             else:
                 try:
@@ -582,6 +657,15 @@ class ChatGPTClient:
                     error_msg = error_data.get("error", {}).get("message", r.text[:200])
                 except:
                     error_msg = r.text[:200]
+                try:
+                    response_cookie_names = sorted({str(k) for k in self.session.cookies.keys()})
+                except Exception:
+                    response_cookie_names = []
+                self._log(
+                    "register_user 失败上下文: "
+                    f"status={r.status_code} final_url={str(r.url)[:120]} "
+                    f"cookie_keys={response_cookie_names}"
+                )
                 self._log(f"注册失败: {r.status_code} - {error_msg}")
                 return False, f"HTTP {r.status_code}: {error_msg}"
                 
@@ -829,18 +913,25 @@ class ChatGPTClient:
                 continue
 
             if self._state_is_email_otp(state):
-                self._log("等待邮箱验证码...")
-                otp_code = skymail_client.wait_for_verification_code(email, timeout=90)
+                settings = get_settings()
+                otp_timeout = max(60, int(getattr(settings, "email_code_timeout", 180) or 180))
+                otp_retry_timeout = max(45, min(otp_timeout, max(60, otp_timeout // 2)))
+                self._log(
+                    f"等待邮箱验证码... 当前邮箱={email} timeout={otp_timeout}s retry_timeout={otp_retry_timeout}s"
+                )
+                otp_code = skymail_client.wait_for_verification_code(email, timeout=otp_timeout)
                 if not otp_code:
-                    return False, "未收到验证码"
+                    return False, f"未收到验证码（等待 {otp_timeout}s）"
 
                 tried_codes = {otp_code}
-                for _ in range(3):
+                for attempt_idx in range(3):
+                    self._log(f"开始验证验证码，第 {attempt_idx + 1}/3 次，code={otp_code}")
                     success, next_state = self.verify_email_otp(otp_code, return_state=True)
                     if success:
                         otp_verified = True
                         state = next_state
                         self.last_registration_state = state
+                        self._log(f"验证码验证通过，进入下一状态: {describe_flow_state(state)}")
                         break
 
                     err_text = str(next_state or "")
@@ -855,14 +946,14 @@ class ChatGPTClient:
                     if not is_wrong_code:
                         return False, f"验证码失败: {next_state}"
 
-                    self._log("验证码疑似过期/错误，尝试获取新验证码...")
+                    self._log("验证码疑似过期/错误，继续守住当前邮箱等待新验证码...")
                     otp_code = skymail_client.wait_for_verification_code(
                         email,
-                        timeout=45,
+                        timeout=otp_retry_timeout,
                         exclude_codes=tried_codes,
                     )
                     if not otp_code:
-                        return False, "未收到新的验证码"
+                        return False, f"未收到新的验证码（额外等待 {otp_retry_timeout}s）"
                     tried_codes.add(otp_code)
 
                 if not otp_verified:
